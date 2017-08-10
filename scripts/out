@@ -22,6 +22,8 @@ payload=$(mktemp /tmp/resource-in.XXXXXX)
 
 cat > $payload <&0
 
+echo $payload
+
 cd $source
 
 insecure_registries=$(jq -r '.source.insecure_registries // [] | join(" ")' < $payload)
@@ -36,6 +38,18 @@ client_certs=$(jq -r '.source.client_certs // []' < $payload)
 
 export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
 export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+export AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
+AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
+AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
+
+mkdir -p ~/.aws
+cat > ~/.aws/credentials <<EOL
+[default]
+aws_access_key_id = $AWS_ACCESS_KEY_ID
+aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
+EOL
+
 
 if private_registry "${repository}" ; then
   registry="$(extract_registry "${repository}")"
@@ -47,6 +61,9 @@ certs_to_file "$ca_certs"
 set_client_certs "$client_certs"
 start_docker "$insecure_registries" "$registry_mirror"
 log_in "$username" "$password" "$registry"
+
+stack=$(jq -r '.params.stack // "preproduction"' < $payload)
+source_repo=$(jq -r '.params.app_name // "echo-client-repo"' < $payload)
 
 tag_source=$(jq -r '.source.tag // "latest"' < $payload)
 tag_params=$(jq -r '.params.tag // ""' < $payload)
@@ -72,43 +89,18 @@ if [ -z "$repository" ]; then
   exit 1
 fi
 
-load=$(jq -r '.params.load // ""' < $payload)
-
-load_base=$(jq -r '.params.load_base // ""' < $payload)
 build=$(jq -r '.params.build // ""' < $payload)
-cache=$(jq -r '.params.cache' < $payload)
-cache_tag=$(jq -r ".params.cache_tag // \"${tag_name}\"" < $payload)
+
 dockerfile=$(jq -r ".params.dockerfile // \"${build}/Dockerfile\"" < $payload)
-
-load_file=$(jq -r '.params.load_file // ""' < $payload)
-load_repository=$(jq -r '.params.load_repository // ""' < $payload)
-load_tag=$(jq -r '.params.load_tag // "latest"' < $payload)
-
-import_file=$(jq -r '.params.import_file // ""' < $payload)
 
 pull_repository=$(jq -r '.params.pull_repository // ""' < $payload)
 pull_tag=$(jq -r '.params.pull_tag // "latest"' < $payload)
+pull_tag_file=$(jq -r '.params.pull_tag_file // ""' < $payload)
 
-if [ -n "$load" ]; then
-  docker load -i "${load}/image"
-  docker tag $(cat "${load}/image-id") "${repository}:${tag_name}"
-elif [ -n "$build" ]; then
+if [ -n "$build" ]; then
   if [ ! -f "$dockerfile" ]; then
     echo "It doesn't appear that given Dockerfile: \"$dockerfile\" is a file"
     exit 1
-  fi
-
-  if [ -n "$load_base" ]; then
-    docker load -i "${load_base}/image"
-    docker tag \
-      "$(cat "${load_base}/image-id")" \
-      "$(cat "${load_base}/repository"):$(cat "${load_base}/tag")"
-  fi
-
-  cache_from=""
-  if [ "$cache" = "true" ]; then
-    docker_pull "${repository}:${cache_tag}"
-    cache_from="--cache-from ${repository}:${cache_tag}"
   fi
 
   expanded_build_args=""
@@ -132,59 +124,36 @@ elif [ -n "$build" ]; then
     docker pull "${ecr_image}"
   fi
 
-  docker build -t "${repository}:${tag_name}" $expanded_build_args -f "$dockerfile" $cache_from "$build"
-elif [ -n "$load_file" ]; then
-  if [ -n "$load_repository" ]; then
-    docker load -i "$load_file"
-    docker tag "${load_repository}:${load_tag}" "${repository}:${tag_name}"
-  else
-    echo "must specify load_repository param"
-    exit 1
-  fi
-elif [ -n "$import_file" ]; then
-  cat "$import_file" | docker import - "${repository}:${tag_name}"
+  docker build -t "${repository}:${tag_name}" $expanded_build_args -f "$dockerfile" "$build"
 elif [ -n "$pull_repository" ]; then
   docker pull "${pull_repository}:${pull_tag}"
   docker tag "${pull_repository}:${pull_tag}" "${repository}:${tag_name}"
 else
-  echo "must specify build, load, load_file, import_file, or pull_repository params"
+  echo "must specify build or pull_repository params"
   exit 1
 fi
 
 image_id="$(image_from_tag "$repository" "$tag_name")"
 
-# afaict there's no clean way to get the digest after a push. docker prints
-# this line at the end at least:
-#
-#   (tagname): digest: (digest) size: (size)
-#
-# so just parse it out
+ls -l 
+ls -l ../
 
-# careful to not let 'tee' mask exit status
+echo "running nova update on $stack in $source_repo with $image_id"
+cd $source_repo
 
-{
-  if ! docker push "${repository}:${tag_name}"; then
-    touch /tmp/push-failed
-  fi
-} | tee push-output
+yes | nova stack update $stack
+nova_status=$(echo $?) 
 
-if [ -e /tmp/push-failed ]; then
-  exit 1
-fi
-
-digest="$(tail -1 push-output | awk '{print $3}')"
-
-if [ "$need_tag_as_latest" = "true" ] && [ "${tag_name}" != "latest"  ]    ; then
-  docker tag "${repository}:${tag_name}" "${repository}:latest"
-  docker push "${repository}:latest"
-  echo "${repository}:${tag_name} tagged as latest"
+if [ "$nova_status" -ne "0" ]; then
+  echo "nova failed"
+  exit 1 
 fi
 
 jq -n "{
-  version: {
-    digest: $(echo $digest | jq -R .)
-  },
-  metadata: [
-    { name: \"image\", value: $(echo $image_id | head -c 12 | jq -R .) }
-  ]
+version: {
+  time: $(date +%s | jq -R .)
+},
+metadata: [
+  { name: \"nova_status\", value: $(echo $nova_status | jq -R .) }
+]
 }" >&3
