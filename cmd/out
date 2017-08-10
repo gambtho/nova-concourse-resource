@@ -1,0 +1,190 @@
+#!/bin/bash
+# vim: set ft=sh
+
+set -e -u
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+source $(dirname $0)/common.sh
+
+source=$1
+
+if [ -z "$source" ]; then
+  echo "usage: $0 <path/to/source>"
+  exit 1
+fi
+
+# for jq
+PATH=/usr/local/bin:$PATH
+
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+
+cat > $payload <&0
+
+cd $source
+
+insecure_registries=$(jq -r '.source.insecure_registries // [] | join(" ")' < $payload)
+
+registry_mirror=$(jq -r '.source.registry_mirror // ""' < $payload)
+
+username=$(jq -r '.source.username // ""' < $payload)
+password=$(jq -r '.source.password // ""' < $payload)
+repository=$(jq -r '.source.repository // ""' < $payload)
+ca_certs=$(jq -r '.source.ca_certs // []' < $payload)
+client_certs=$(jq -r '.source.client_certs // []' < $payload)
+
+export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+
+if private_registry "${repository}" ; then
+  registry="$(extract_registry "${repository}")"
+else
+  registry=
+fi
+
+certs_to_file "$ca_certs"
+set_client_certs "$client_certs"
+start_docker "$insecure_registries" "$registry_mirror"
+log_in "$username" "$password" "$registry"
+
+tag_source=$(jq -r '.source.tag // "latest"' < $payload)
+tag_params=$(jq -r '.params.tag // ""' < $payload)
+tag_prefix=$(jq -r '.params.tag_prefix // ""' < $payload)
+need_tag_as_latest=$(jq -r '.params.tag_as_latest // "false"' < $payload)
+build_args=$(jq -r '.params.build_args // []' < $payload)
+build_args_file=$(jq -r '.params.build_args_file // ""' < $payload)
+
+
+tag_name=""
+if [ -n "$tag_params" ]; then
+  if [ ! -f "$tag_params" ]; then
+    echo "tag file '$tag_params' does not exist"
+    exit 1
+  fi
+  tag_name="${tag_prefix}$(cat $tag_params)"
+else
+  tag_name="$tag_source"
+fi
+
+if [ -z "$repository" ]; then
+  echo "must specify repository"
+  exit 1
+fi
+
+load=$(jq -r '.params.load // ""' < $payload)
+
+load_base=$(jq -r '.params.load_base // ""' < $payload)
+build=$(jq -r '.params.build // ""' < $payload)
+cache=$(jq -r '.params.cache' < $payload)
+cache_tag=$(jq -r ".params.cache_tag // \"${tag_name}\"" < $payload)
+dockerfile=$(jq -r ".params.dockerfile // \"${build}/Dockerfile\"" < $payload)
+
+load_file=$(jq -r '.params.load_file // ""' < $payload)
+load_repository=$(jq -r '.params.load_repository // ""' < $payload)
+load_tag=$(jq -r '.params.load_tag // "latest"' < $payload)
+
+import_file=$(jq -r '.params.import_file // ""' < $payload)
+
+pull_repository=$(jq -r '.params.pull_repository // ""' < $payload)
+pull_tag=$(jq -r '.params.pull_tag // "latest"' < $payload)
+
+if [ -n "$load" ]; then
+  docker load -i "${load}/image"
+  docker tag $(cat "${load}/image-id") "${repository}:${tag_name}"
+elif [ -n "$build" ]; then
+  if [ ! -f "$dockerfile" ]; then
+    echo "It doesn't appear that given Dockerfile: \"$dockerfile\" is a file"
+    exit 1
+  fi
+
+  if [ -n "$load_base" ]; then
+    docker load -i "${load_base}/image"
+    docker tag \
+      "$(cat "${load_base}/image-id")" \
+      "$(cat "${load_base}/repository"):$(cat "${load_base}/tag")"
+  fi
+
+  cache_from=""
+  if [ "$cache" = "true" ]; then
+    docker_pull "${repository}:${cache_tag}"
+    cache_from="--cache-from ${repository}:${cache_tag}"
+  fi
+
+  expanded_build_args=""
+  if [ -n "$build_args" ]; then
+    expanded_build_args=$(echo $build_args|jq -r 'with_entries(.key |= "--build-arg " + . )|with_entries(.key = .key + "=" +.value)|keys|join(" ")')
+  fi
+
+  if [ -n "$build_args_file" ]; then
+    expanded_build_args=${expanded_build_args}" "$(jq -r 'with_entries(.key |= "--build-arg " + . )|with_entries(.key = .key + "=" +.value)|keys|join(" ")' <$build_args_file)
+  fi
+
+  ECR_REGISTRY_PATTERN='/[a-zA-Z0-9][a-zA-Z0-9_-]*\.dkr\.ecr\.[a-zA-Z0-9][a-zA-Z0-9_-]*\.amazonaws\.com(\.cn)?[^ ]*/'
+  ecr_image=$(grep '^\s*FROM' ${dockerfile} | \
+             awk "match(\$0,${ECR_REGISTRY_PATTERN}){print substr(\$0, RSTART, RLENGTH)}" )
+  if [ -n "$ecr_image" ]; then
+    # pull will perform an authentication process needed for ECR
+    # there is an experimental endpoint to support long running sessions
+    # docker cli does not support it yet though
+    # see https://github.com/moby/moby/pull/32677
+    # and https://github.com/awslabs/amazon-ecr-credential-helper/issues/9
+    docker pull "${ecr_image}"
+  fi
+
+  docker build -t "${repository}:${tag_name}" $expanded_build_args -f "$dockerfile" $cache_from "$build"
+elif [ -n "$load_file" ]; then
+  if [ -n "$load_repository" ]; then
+    docker load -i "$load_file"
+    docker tag "${load_repository}:${load_tag}" "${repository}:${tag_name}"
+  else
+    echo "must specify load_repository param"
+    exit 1
+  fi
+elif [ -n "$import_file" ]; then
+  cat "$import_file" | docker import - "${repository}:${tag_name}"
+elif [ -n "$pull_repository" ]; then
+  docker pull "${pull_repository}:${pull_tag}"
+  docker tag "${pull_repository}:${pull_tag}" "${repository}:${tag_name}"
+else
+  echo "must specify build, load, load_file, import_file, or pull_repository params"
+  exit 1
+fi
+
+image_id="$(image_from_tag "$repository" "$tag_name")"
+
+# afaict there's no clean way to get the digest after a push. docker prints
+# this line at the end at least:
+#
+#   (tagname): digest: (digest) size: (size)
+#
+# so just parse it out
+
+# careful to not let 'tee' mask exit status
+
+{
+  if ! docker push "${repository}:${tag_name}"; then
+    touch /tmp/push-failed
+  fi
+} | tee push-output
+
+if [ -e /tmp/push-failed ]; then
+  exit 1
+fi
+
+digest="$(tail -1 push-output | awk '{print $3}')"
+
+if [ "$need_tag_as_latest" = "true" ] && [ "${tag_name}" != "latest"  ]    ; then
+  docker tag "${repository}:${tag_name}" "${repository}:latest"
+  docker push "${repository}:latest"
+  echo "${repository}:${tag_name} tagged as latest"
+fi
+
+jq -n "{
+  version: {
+    digest: $(echo $digest | jq -R .)
+  },
+  metadata: [
+    { name: \"image\", value: $(echo $image_id | head -c 12 | jq -R .) }
+  ]
+}" >&3
