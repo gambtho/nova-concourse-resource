@@ -36,19 +36,8 @@ repository=$(jq -r '.source.repository // ""' < $payload)
 ca_certs=$(jq -r '.source.ca_certs // []' < $payload)
 client_certs=$(jq -r '.source.client_certs // []' < $payload)
 
-export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
-export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
-export AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
-AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
-AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
-AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
 
-mkdir -p ~/.aws
-cat > ~/.aws/credentials <<EOL
-[default]
-aws_access_key_id = $AWS_ACCESS_KEY_ID
-aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
-EOL
+
 
 
 if private_registry "${repository}" ; then
@@ -62,8 +51,22 @@ set_client_certs "$client_certs"
 start_docker "$insecure_registries" "$registry_mirror"
 log_in "$username" "$password" "$registry"
 
-stack=$(jq -r '.params.stack // "preproduction"' < $payload)
-source_repo=$(jq -r '.params.app_name // "echo-client-repo"' < $payload)
+export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+export AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
+AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id // ""' < $payload)
+AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key // ""' < $payload)
+AWS_DEFAULT_REGION=$(jq -r '.source.aws_default_region // ""' < $payload)
+
+nova_stack=$(jq -r '.params.stack // "preproduction"' < $payload)
+nova_env=$(jq -r '.params.env // "preproduction"' < $payload)
+source_repo=$(jq -r '.params.source_repo // "echo-client-repo"' < $payload)
+mkdir -p ~/.aws
+cat > ~/.aws/credentials <<EOL
+[$nova_env]
+aws_access_key_id = $AWS_ACCESS_KEY_ID
+aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
+EOL
 
 tag_source=$(jq -r '.source.tag // "latest"' < $payload)
 tag_params=$(jq -r '.params.tag // ""' < $payload)
@@ -138,10 +141,10 @@ image_id="$(image_from_tag "$repository" "$tag_name")"
 ls -l 
 ls -l ../
 
-echo "running nova update on $stack in $source_repo with $image_id"
+echo "running nova deploy $nova_env $nova_stack in $source_repo with $image_id"
 cd $source_repo
 
-yes | nova stack update $stack
+yes | nova deploy $nova_env $nova_stack
 nova_status=$(echo $?) 
 
 if [ "$nova_status" -ne "0" ]; then
